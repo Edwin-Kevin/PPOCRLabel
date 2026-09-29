@@ -53,7 +53,6 @@ class Shape(object):
         self,
         label=None,
         line_color=None,
-        difficult=False,
         key_cls="None",
         paintLabel=False,
         paintIdx=False,
@@ -64,7 +63,6 @@ class Shape(object):
         self.points = []
         self.fill = False
         self.selected = False
-        self.difficult = difficult
         self.key_cls = key_cls
         self.paintLabel = paintLabel
         self.paintIdx = paintIdx
@@ -104,14 +102,12 @@ class Shape(object):
         return pRes
 
     def close(self):
-        try:
-            self.center = QPointF(
-                (self.points[0].x() + self.points[2].x()) / 2,
-                (self.points[0].y() + self.points[2].y()) / 2,
-            )
-        except Exception:
+        if self.points:
+            x = sum(p.x() for p in self.points) / len(self.points)
+            y = sum(p.y() for p in self.points) / len(self.points)
+            self.center = QPointF(x, y)
+        else:
             self.center = None
-            logger.warning("The XY coordinates of QPointF are not detectable!")
         self._closed = True
 
     def reachMaxPoints(self):
@@ -270,7 +266,6 @@ class Shape(object):
             shape.line_color = self.line_color
         if self.fill_color != Shape.fill_color:
             shape.fill_color = self.fill_color
-        shape.difficult = self.difficult
         shape.key_cls = self.key_cls
         return shape
 

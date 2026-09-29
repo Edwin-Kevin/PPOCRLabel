@@ -15,6 +15,8 @@ PPOCRLabelv3 is a semi-automatic graphic annotation tool suitable for OCR field,
 | <img src="./data/gif/multi-point.gif" width="80%"/> |  <img src="./data/gif/kie.gif" width="100%"/>  |
 
 ### Recent Update
+- 2026.03:
+  - Add the `Settings` to change the application's font size.
 - 2025.06:
   - Add the `Resort Bounding Box Positions` features. For usage details, please refer to the `11. Additional Feature Description` in the `2.1 Operational Steps` section below.
 - 2024.11:
@@ -23,9 +25,11 @@ PPOCRLabelv3 is a semi-automatic graphic annotation tool suitable for OCR field,
 - 2024.09:
   - Added `Re-recognition` and `Auto Save Unsaved changes` features. For usage details, please refer to the `11. Additional Feature Description` in the `2.1 Operational Steps` section below.
   - Added the parameter `--img_list_natural_sort`, which defaults to natural sorting for the left image list. After configuring this parameter, character sorting will be used to easily locate images based on character order.
-  - Add 4 custom model parameters:
+  - Add 6 custom model parameters:
     - `det_model_dir`: Path to the detection model directory
+    - `det_model_name`: Name of the detection model
     - `rec_model_dir`: Path to the recognition model directory
+    - `rec_model_name`: Name of the recognition model
     - `rec_char_dict_path`: Path to the recognition model dictionary file
     - `cls_model_dir`: Path to the classification model directory
   - Added the `--bbox_auto_zoom_center` parameter, which can be enabled when there is only one bounding box in the image, automatically centering and zooming in on the bounding box.
@@ -164,7 +168,7 @@ PPOCRLabel.exe --lang ch
 
 6. Click 're-Recognition', model will rewrite ALL recognition results in ALL detection box<sup>[3]</sup>.
 
-7. Single click the result in 'recognition result' list to manually change inaccurate recognition results.
+7. Single click the result in 'recognition result' list to manually change inaccurate recognition results. **Note:** If the text is illegible or extremely blurry, it is recommended to change the label to `###`. The PaddleOCR training pipeline will treat these as "ignore" regions, ensuring they don't negatively impact your model's fine-tuning.
 
 8. **Click "Check", the image status will switch to "√",then the program automatically jump to the next.**
 
@@ -173,6 +177,8 @@ PPOCRLabel.exe --lang ch
 10. Labeling result: the user can export the label result manually through the menu "File - Export Label", while the program will also export automatically if "File - Auto export Label Mode" is selected. The manually checked label will be stored in *Label.txt* under the opened picture folder. Click "File"-"Export Recognition Results" in the menu bar, the recognition training data of such pictures will be saved in the *crop_img* folder, and the recognition label will be saved in *rec_gt.txt*<sup>[4]</sup>.
 
 11. Additional Feature Description
+    - **The "###" vs "*":** The core **PaddleOCR detection training pipeline** ignores boolean flags and specifically looks for the transcription string `###` or `*` to identify regions that should be ignored. For maximum compatibility with all fine-tuning stages (both Detection and Recognition), always use `###` for unreadable text.
+    - **The "difficult" flag:** You may notice a `difficult` field in the exported `Label.txt`. This is a legacy field from the original `labelImg` tool. In this version of PPOCRLabel, this field is **hardcoded to `False`** for all exported labels to ensure backward compatibility with third-party data pipelines and older versions of the application while preventing unintended data exclusion during training exports.
     - `File` -> `Re-recognition`: After checking, the newly annotated box content will automatically trigger the `Re-recognition` function of the current annotation box, eliminating the need to click the Re-identify button. This is suitable for scenarios where you do not want to use Automatic Annotation but prefer manual annotation, such as license plate recognition. In a single image with only one license plate, using Automatic Annotation would require deleting many additional recognized text boxes, which is less efficient than directly re-annotating.
     - `File` -> `Auto Save Unsaved changes`: By default, you need to press the `Check` button to complete the marking confirmation for the current box, which can be cumbersome. After checking, when switching to the next image (by pressing the shortcut key `D`), a prompt box asking to confirm whether to save unconfirmed markings will no longer appear. The current markings will be automatically saved and the next image will be switched, making it convenient for quick marking.
     - After selecting the bounding box, there are 5 shortcut keys available to individually control the movement of the four vertices of the bounding box, suitable for scenarios that require precise control over the positions of the bounding box vertices:
@@ -182,6 +188,7 @@ PPOCRLabel.exe --lang ch
       - `v`: After pressing, the up, down, left, and right arrow keys will move the 4th vertex individually.
       - `b`: After pressing, the up, down, left, and right arrow keys will revert to the default action of moving the entire bounding box.
     - `Bottom right` -> `Resort Positions`: Clicking this will arrange the bounding boxes in order from top to bottom and left to right. This is used to address the issue of manually adjusting the order after adding rectangular labels when identifying table structures.
+    - `File` -> `Settings`: Clicking this will open a popup where the user can set the application's font size. This setting is saved and applied to all UI elements in future sessions.
 
 ### 2.2 Table Annotation
 
@@ -234,10 +241,12 @@ labeling in the Excel file, the recommended steps are:
 | W                        | Create a rect box                                |
 | Q  or  Home              | Create a multi-points box                         |
 | Ctrl + E                 | Edit label of the selected box                   |
+| Ctrl + G                 | Focus and zoom into the selected box             |
 | Ctrl + X                 | Change key class of the box when enable `--kie`  |
 | Ctrl + R                 | Re-recognize the selected box                    |
 | Ctrl + C                 | Copy and paste the selected box                  |
 | Ctrl + B                 | Resort Bounding Box Positions |
+| Ctrl + T                 | Convert PolygonBox to RectBox |
 | Ctrl + Left Mouse Button | Multi select the label box                       |
 | Backspace or Delete      | Delete the selected box                          |
 | Ctrl + V  or End         | Check image                                      |
@@ -256,7 +265,13 @@ labeling in the Excel file, the recommended steps are:
 - Model language switching: Changing the built-in model language is supportable by clicking "PaddleOCR"-"Choose OCR Model" in the menu bar. Currently supported languages​include French, German, Korean, and Japanese.
   For specific model download links, please refer to [PaddleOCR Model List](https://github.com/PaddlePaddle/PaddleOCR/blob/release/3.0/docs/version3.x/model_list.md).
 
-- **Custom Model**: If users want to replace the built-in model with their own inference model. Through the following code example:
+- **Custom Model**: If users want to replace the built-in model with their own inference model, they can now do so directly via the command line:
+
+```bash
+python PPOCRLabel.py --det_model_dir {your_det_model_dir} --det_model_name {your_det_model_name} --rec_model_dir {your_rec_model_dir} --rec_model_name {your_rec_model_name}
+```
+
+Alternatively, you can modify the code as shown below:
  ```
  from paddleocr import PaddleOCR, PPStructureV3
   ocr = PaddleOCR(

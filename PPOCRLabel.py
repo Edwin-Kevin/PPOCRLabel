@@ -19,6 +19,7 @@ import codecs
 import json
 import os
 import platform
+import signal
 import subprocess
 import sys
 from functools import partial
@@ -45,6 +46,7 @@ from PyQt5.QtGui import (
     QColor,
     QIcon,
     QFontDatabase,
+    QFontMetrics,
 )
 from PyQt5.QtWidgets import (
     QMainWindow,
@@ -97,6 +99,7 @@ from libs.constants import (
     SETTING_WIN_POSE,
     SETTING_WIN_SIZE,
     SETTING_WIN_STATE,
+    SETTING_FONT_SIZE,
 )
 from libs.utils import (
     addActions,
@@ -135,7 +138,66 @@ import logging
 logger = logging.getLogger("PPOCRLabel")
 
 
+def moveFileToTrash(filePath):
+    if platform.system() == "Windows":
+        import ctypes
+        from ctypes import wintypes
+
+        class SHFILEOPSTRUCTW(ctypes.Structure):
+            _fields_ = [
+                ("hwnd", wintypes.HWND),
+                ("wFunc", wintypes.UINT),
+                ("pFrom", wintypes.LPCWSTR),
+                ("pTo", wintypes.LPCWSTR),
+                ("fFlags", ctypes.c_ushort),
+                ("fAnyOperationsAborted", wintypes.BOOL),
+                ("hNameMappings", ctypes.c_void_p),
+                ("lpszProgressTitle", wintypes.LPCWSTR),
+            ]
+
+        operation = SHFILEOPSTRUCTW()
+        operation.wFunc = 3  # FO_DELETE
+        fromPath = os.path.abspath(filePath) + "\0\0"
+        fromBuffer = ctypes.create_unicode_buffer(fromPath)
+        operation.pFrom = ctypes.cast(fromBuffer, wintypes.LPCWSTR)
+        operation.fFlags = 0x0040 | 0x0010 | 0x0004 | 0x0400
+        result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(operation))
+        return result == 0 and not operation.fAnyOperationsAborted
+
+    if platform.system() == "Linux":
+        return subprocess.call(["trash", filePath]) == 0
+
+    if platform.system() == "Darwin":
+        absPath = os.path.abspath(filePath).replace("\\", "\\\\").replace('"', '\\"')
+        cmd = [
+            "osascript",
+            "-e",
+            'tell app "Finder" to move {the POSIX file "' + absPath + '"} to trash',
+        ]
+        logger.debug("Executing command: %s", " ".join(cmd))
+        with open(os.devnull, "w") as devnull:
+            return subprocess.call(cmd, stdout=devnull) == 0
+
+    return False
+
+
 __appname__ = "PPOCRLabel"
+
+DEFAULT_RECOGNITION_MODELS = {
+    "ch": "PP-OCRv5_mobile_rec",
+    "en": "en_PP-OCRv5_mobile_rec",
+    "french": "latin_PP-OCRv5_mobile_rec",
+    "german": "latin_PP-OCRv5_mobile_rec",
+    "korean": "korean_PP-OCRv5_mobile_rec",
+    "japan": "PP-OCRv5_server_rec",
+}
+
+
+def getRecognitionModelName(lang, modelName, modelDir):
+    if modelDir is None and modelName == "PP-OCRv5_mobile_rec":
+        return DEFAULT_RECOGNITION_MODELS[lang]
+    return modelName
+
 
 LABEL_COLORMAP = label_colormap()
 
@@ -154,7 +216,9 @@ class MainWindow(QMainWindow):
         default_predefined_class_file=None,
         default_save_dir=None,
         det_model_dir=None,
+        det_model_name="PP-OCRv5_mobile_det",
         rec_model_dir=None,
+        rec_model_name="PP-OCRv5_mobile_rec",
         cls_model_dir=None,
         label_font_path=None,
         selected_shape_color=(255, 255, 0),
@@ -190,34 +254,42 @@ class MainWindow(QMainWindow):
         self.key_dialog_tip = get_str("keyDialogTip")
 
         self.defaultSaveDir = default_save_dir
+        self.det_model_dir = det_model_dir
+        self.det_model_name = det_model_name
+        self.rec_model_dir = rec_model_dir
+        self.rec_model_name = rec_model_name
+        self.cls_model_dir = cls_model_dir
+        self.model_lang = self.lang if self.lang in DEFAULT_RECOGNITION_MODELS else "ch"
+        recognition_model_name = getRecognitionModelName(
+            self.model_lang, self.rec_model_name, self.rec_model_dir
+        )
 
         params = {
             "use_doc_orientation_classify": False,
             "use_doc_unwarping": False,
             "use_textline_orientation": False,
             "device": self.gpu,
-            "lang": self.lang,
-            "text_detection_model_name": "PP-OCRv5_mobile_det",
-            "text_recognition_model_name": "PP-OCRv5_mobile_rec",
+            "text_detection_model_name": self.det_model_name,
+            "text_recognition_model_name": recognition_model_name,
             "enable_mkldnn": False,
         }
 
-        if det_model_dir is not None:
-            params["text_detection_model_dir"] = det_model_dir
-        if rec_model_dir is not None:
-            params["text_recognition_model_dir"] = rec_model_dir
-        if cls_model_dir is not None:
-            params["text_line_orientation_model_dir"] = cls_model_dir
+        if self.det_model_dir is not None:
+            params["text_detection_model_dir"] = self.det_model_dir
+        if self.rec_model_dir is not None:
+            params["text_recognition_model_dir"] = self.rec_model_dir
+        if self.cls_model_dir is not None:
+            params["text_line_orientation_model_dir"] = self.cls_model_dir
 
         self.ocr = PaddleOCR(**params)
         self.text_recognizer = TextRecognition(
-            model_name="PP-OCRv5_mobile_rec",
-            model_dir=rec_model_dir,
+            model_name=recognition_model_name,
+            model_dir=self.rec_model_dir,
             device=self.gpu,
         )
         self.text_detector = TextDetection(
-            model_name="PP-OCRv5_mobile_det",
-            model_dir=det_model_dir,
+            model_name=self.det_model_name,
+            model_dir=self.det_model_dir,
             device=self.gpu,
         )
         self.table_ocr = PPStructureV3(
@@ -289,6 +361,9 @@ class MainWindow(QMainWindow):
         self.fileDock = QDockWidget(self.fileListName, self)
         self.fileDock.setObjectName(get_str("files"))
         self.fileDock.setWidget(fileListContainer)
+        dock_font = self.fileDock.font()
+        dock_font.setPointSize(20)
+        self.fileDock.setFont(dock_font)
         self.addDockWidget(Qt.LeftDockWidgetArea, self.fileDock)
 
         #  ================== Key List  ==================
@@ -364,6 +439,7 @@ class MainWindow(QMainWindow):
 
         # Create and add a widget for showing current label item index
         self.indexList = QListWidget()
+        self.indexList.setSpacing(0)
         self.indexList.setMaximumSize(30, 16777215)  # limit max width
         self.indexList.setEditTriggers(QAbstractItemView.NoEditTriggers)  # no editable
         self.indexList.itemSelectionChanged.connect(self.indexSelectionChanged)
@@ -379,6 +455,7 @@ class MainWindow(QMainWindow):
 
         # Create and add a widget for showing current label items
         self.labelList = EditInList()
+        self.labelList.setSpacing(0)
         labelListContainer = QWidget()
         labelListContainer.setLayout(listLayout)
         self.labelList.itemSelectionChanged.connect(self.labelSelectionChanged)
@@ -525,6 +602,7 @@ class MainWindow(QMainWindow):
         }
         self.scrollArea = scroll
         self.canvas.scrollRequest.connect(self.scrollRequest)
+        self.canvas.pixelScrollRequest.connect(self.pixelScrollRequest)
 
         self.canvas.newShape.connect(partial(self.newShape, False))
         self.canvas.shapeMoved.connect(self.updateBoxlist)  # self.setDirty
@@ -755,12 +833,30 @@ class MainWindow(QMainWindow):
             enabled=False,
         )
 
+        focusAndZoom = action(
+            get_str("focusAndZoom"),
+            self.focusAndZoom,
+            "Ctrl+G",
+            "zoom",
+            get_str("focusAndZoomDetail"),
+            enabled=False,
+        )
+
         AutoRec = action(
             get_str("autoRecognition"),
             self.autoRecognition,
             "",
             "Auto",
             get_str("autoRecognition"),
+            enabled=False,
+        )
+
+        autoRecCurrent = action(
+            get_str("autoRecognitionCurrent"),
+            self.autoRecognitionCurrent,
+            None,
+            "Auto",
+            get_str("autoRecognitionCurrent"),
             enabled=False,
         )
 
@@ -906,6 +1002,24 @@ class MainWindow(QMainWindow):
             enabled=True,
         )
 
+        convertToRect = action(
+            get_str("convertToRect"),
+            self.convertToRect,
+            "Ctrl+T",
+            "edit",
+            get_str("convertToRectDetail"),
+            enabled=False,
+        )
+
+        settings_action = action(
+            get_str("settings"),
+            self.showSettingsDialog,
+            None,
+            "help",
+            get_str("settingsDetail"),
+            enabled=True,
+        )
+
         self.editButton.setDefaultAction(edit)
         self.newButton.setDefaultAction(create)
         self.createpolyButton.setDefaultAction(createpoly)
@@ -955,7 +1069,7 @@ class MainWindow(QMainWindow):
 
         # Label list context menu.
         labelMenu = QMenu()
-        addActions(labelMenu, (edit, delete))
+        addActions(labelMenu, (edit, focusAndZoom, delete))
 
         self.labelList.setContextMenuPolicy(Qt.CustomContextMenu)
         self.labelList.customContextMenuRequested.connect(self.popLabelListMenu)
@@ -977,10 +1091,13 @@ class MainWindow(QMainWindow):
             tableRec=tableRec,
             delete=delete,
             edit=edit,
+            focusAndZoom=focusAndZoom,
+            convertToRect=convertToRect,
             copy=copy,
             saveRec=saveRec,
             singleRere=singleRere,
             AutoRec=AutoRec,
+            autoRecCurrent=autoRecCurrent,
             reRec=reRec,
             cellreRec=cellreRec,
             createMode=createMode,
@@ -1018,6 +1135,8 @@ class MainWindow(QMainWindow):
             editMenu=(
                 createpoly,
                 edit,
+                focusAndZoom,
+                convertToRect,
                 copy,
                 delete,
                 singleRere,
@@ -1041,6 +1160,8 @@ class MainWindow(QMainWindow):
                 create,
                 createpoly,
                 edit,
+                focusAndZoom,
+                convertToRect,
                 copy,
                 delete,
                 singleRere,
@@ -1133,6 +1254,7 @@ class MainWindow(QMainWindow):
                 self.autoReRecognitionOption,
                 self.autoSaveUnsavedChangesOption,
                 None,
+                settings_action,
                 resetAll,
                 deleteImg,
                 quit,
@@ -1159,7 +1281,10 @@ class MainWindow(QMainWindow):
             ),
         )
 
-        addActions(self.menus.autolabel, (AutoRec, reRec, cellreRec, alcm, None, help))
+        addActions(
+            self.menus.autolabel,
+            (AutoRec, autoRecCurrent, reRec, cellreRec, alcm, None, help),
+        )
 
         self.menus.file.aboutToShow.connect(self.updateFileMenu)
 
@@ -1179,8 +1304,6 @@ class MainWindow(QMainWindow):
         self.fillColor = None
         self.zoom_level = 100
         self.fit_window = False
-        # Add Chris
-        self.difficult = False
 
         # Fix the compatible issue for qt4 and qt5. Convert the QStringList to python list
         if settings.get(SETTING_RECENT_FILES):
@@ -1215,8 +1338,6 @@ class MainWindow(QMainWindow):
             settings.get(SETTING_FILL_COLOR, DEFAULT_FILL_COLOR)
         )
         self.canvas.setDrawingColor(self.lineColor)
-        # Add chris
-        Shape.difficult = self.difficult
 
         # ADD:
         # Populate the File menu dynamically.
@@ -1254,6 +1375,9 @@ class MainWindow(QMainWindow):
 
         # selected shape color
         self.selected_shape_color = selected_shape_color
+
+        # apply font size
+        self.applyFontSize(self.settings.get(SETTING_FONT_SIZE, 12))
 
     def menu(self, title, actions=None):
         menu = self.menuBar().addMenu(title)
@@ -1376,6 +1500,58 @@ class MainWindow(QMainWindow):
     def showKeysDialog(self):
         msg = keysInfo(self.lang)
         QMessageBox.information(self, "Information", msg)
+
+    def applyFontSize(self, fontSize):
+        # 1. Update standard font objects
+        f = self.font()
+        f.setPointSize(fontSize)
+        QApplication.instance().setFont(f)
+        self.setFont(f)
+
+        # 2. Universal Stylesheet with explicit component targeting.
+        # This is more effective on macOS than a generic QWidget rule.
+        style = f"""
+            QWidget, QLabel, QDockWidget, QMenuBar, QMenu, QStatusBar, QListWidget, QSpinBox, QToolButton {{
+                font-size: {fontSize}pt;
+            }}
+            QDockWidget {{
+                font-size: {fontSize}pt;
+                font-weight: bold;
+            }}
+            QDockWidget::title {{
+                font-size: {fontSize}pt;
+                padding: 4px;
+            }}
+        """
+        QApplication.instance().setStyleSheet(style)
+
+        # 3. Update specific measurements
+        fm = QFontMetrics(f)
+        if hasattr(self, "indexList"):
+            width = fm.width("8888") + 10
+            self.indexList.setFixedWidth(width)
+            self.indexList.setUniformItemSizes(True)
+        if hasattr(self, "labelList"):
+            self.labelList.setUniformItemSizes(True)
+        if hasattr(self, "AutoRecognitionNum"):
+            width = fm.width("8888") + 30
+            self.AutoRecognitionNum.setFixedWidth(width)
+
+    def showSettingsDialog(self):
+        from PyQt5.QtWidgets import QInputDialog
+
+        fontSize, ok = QInputDialog.getInt(
+            self,
+            self.stringBundle.getString("settings"),
+            self.stringBundle.getString("fontSize"),
+            self.settings.get(SETTING_FONT_SIZE, 12),
+            6,
+            100,
+        )
+        if ok:
+            self.settings[SETTING_FONT_SIZE] = fontSize
+            self.settings.save()
+            self.applyFontSize(fontSize)
 
     def createShape(self):
         assert self.beginner()
@@ -1501,6 +1677,71 @@ class MainWindow(QMainWindow):
             # item.setBackground(generateColorByText(text))
             self.setDirty()
             self.updateComboBox()
+
+    def focusAndZoom(self):
+        if not self.canvas.selectedShapes:
+            return
+
+        # We only focus on the first selected shape if multiple are selected
+        shape = self.canvas.selectedShapes[0]
+
+        # Calculate the center of the shape
+        points = shape.points
+        if not points:
+            return
+
+        center_x, center_y, _ = polygon_bounding_box_center_and_area(points)
+
+        # Determine target zoom level
+        vw = self.scrollArea.viewport().width()
+        vh = self.scrollArea.viewport().height()
+
+        # Get bounding box of the shape
+        min_x = min(p.x() for p in points)
+        max_x = max(p.x() for p in points)
+        min_y = min(p.y() for p in points)
+        max_y = max(p.y() for p in points)
+
+        bw = max_x - min_x
+        bh = max_y - min_y
+
+        # Avoid division by zero
+        if bw == 0 or bh == 0:
+            return
+
+        # Target zoom such that box takes up say 60% of viewport
+        zoom_x = (vw * 0.6) / bw
+        zoom_y = (vh * 0.6) / bh
+
+        target_zoom = min(zoom_x, zoom_y) * 100
+
+        # Clamp zoom level to reasonable range (e.g. 50% to 500%)
+        target_zoom = max(50, min(target_zoom, 500))
+
+        # Set zoom
+        self.setZoom(target_zoom)
+        self.imageSlider.setValue(int(target_zoom))
+
+        # Schedule centering after layout updates to ensure scrollbars are updated
+        QTimer.singleShot(0, lambda: self.centerOnPoint(center_x, center_y))
+
+    def centerOnPoint(self, x, y):
+        vw = self.scrollArea.viewport().width()
+        vh = self.scrollArea.viewport().height()
+
+        scale = 0.01 * self.zoomWidget.value()
+
+        # Zoomed coordinates
+        zx = x * scale
+        zy = y * scale
+
+        # Scroll area's bars
+        h_bar = self.scrollBars[Qt.Horizontal]
+        v_bar = self.scrollBars[Qt.Vertical]
+
+        # Set values to center zx, zy in viewport
+        h_bar.setValue(int(zx - vw / 2))
+        v_bar.setValue(int(zy - vh / 2))
 
     # =================== detection box related functions ===================
     def boxItemChanged(self, item):
@@ -1653,27 +1894,26 @@ class MainWindow(QMainWindow):
         self.actions.delete.setEnabled(n_selected)
         self.actions.copy.setEnabled(n_selected)
         self.actions.edit.setEnabled(n_selected == 1)
+        self.actions.focusAndZoom.setEnabled(n_selected > 0)
         self.actions.lock.setEnabled(n_selected)
         self.actions.change_cls.setEnabled(n_selected)
         self.actions.expand.setEnabled(n_selected)
+        self.actions.convertToRect.setEnabled(n_selected > 0)
 
     def addLabel(self, shape):
         shape.paintLabel = self.displayLabelOption.isChecked()
         shape.paintIdx = self.displayIndexOption.isChecked()
 
         item = HashableQListWidgetItem(shape.label)
-        # current difficult checkbox is disable
-        # item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-        # item.setCheckState(Qt.Unchecked) if shape.difficult else item.setCheckState(Qt.Checked)
 
-        # Checked means difficult is False
         # item.setBackground(generateColorByText(shape.label))
         self.itemsToShapes[item] = shape
         self.shapesToItems[shape] = item
         # add current label item index before label string
         current_index = QListWidgetItem(str(self.labelList.count()))
-        current_index.setTextAlignment(Qt.AlignHCenter)
+        current_index.setTextAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
         self.indexList.addItem(current_index)
+        item.setTextAlignment(Qt.AlignVCenter)
         self.labelList.addItem(item)
         # print('item in add label is ',[(p.x(), p.y()) for p in shape.points], shape.label)
 
@@ -1718,7 +1958,7 @@ class MainWindow(QMainWindow):
     def loadLabels(self, shapes):
         s = []
         shape_index = 0
-        for label, points, line_color, key_cls, difficult in shapes:
+        for label, points, line_color, key_cls in shapes:
             shape = Shape(
                 label=label,
                 line_color=line_color,
@@ -1732,7 +1972,6 @@ class MainWindow(QMainWindow):
                     self.setDirty()
 
                 shape.addPoint(QPointF(x, y))
-            shape.difficult = difficult
             shape.idx = shape_index
             shape_index += 1
             # shape.locked = False
@@ -1775,7 +2014,7 @@ class MainWindow(QMainWindow):
         self.indexList.clear()
         for i in range(self.labelList.count()):
             string = QListWidgetItem(str(i))
-            string.setTextAlignment(Qt.AlignHCenter)
+            string.setTextAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
             self.indexList.addItem(string)
 
     def saveLabels(self, annotationFilePath, mode="Auto"):
@@ -1789,7 +2028,6 @@ class MainWindow(QMainWindow):
                 line_color=s.line_color.getRgb(),
                 fill_color=s.fill_color.getRgb(),
                 points=[(int(p.x()), int(p.y())) for p in s.points],  # QPonitF
-                difficult=s.difficult,
                 key_cls=s.key_cls,
             )  # bool
 
@@ -1803,7 +2041,7 @@ class MainWindow(QMainWindow):
             ]
         # Can add different annotation formats here
         for box in self.result_dic:
-            trans_dic = {"label": box[1][0], "points": box[0], "difficult": False}
+            trans_dic = {"label": box[1][0], "points": box[0]}
             if self.kie_mode:
                 if len(box) == 3:
                     trans_dic.update({"key_cls": box[2]})
@@ -1819,7 +2057,7 @@ class MainWindow(QMainWindow):
                 trans_dict = {
                     "transcription": box["label"],
                     "points": box["points"],
-                    "difficult": box["difficult"],
+                    "difficult": False,
                 }
                 if self.kie_mode:
                     trans_dict.update({"key_cls": box["key_cls"]})
@@ -1897,14 +2135,6 @@ class MainWindow(QMainWindow):
                 shape.label = item.text()
                 # shape.line_color = generateColorByText(shape.label)
                 self.setDirty()
-            elif not ((item.checkState() == Qt.Unchecked) ^ (not shape.difficult)):
-                shape.difficult = True if item.checkState() == Qt.Unchecked else False
-                self.setDirty()
-            else:  # User probably changed item visibility
-                self.canvas.setShapeVisible(
-                    shape, True
-                )  # item.checkState() == Qt.Checked
-                # self.actions.save.setEnabled(True)
         else:
             logger.warning(
                 "enter labelItemChanged slot with unhashable item: %s %s",
@@ -2023,6 +2253,11 @@ class MainWindow(QMainWindow):
         units = -delta / (8 * 15)
         bar = self.scrollBars[orientation]
         bar.setValue(int(bar.value() + bar.singleStep() * units))
+
+    def pixelScrollRequest(self, dx, dy):
+        for orientation, delta in [(Qt.Horizontal, dx), (Qt.Vertical, dy)]:
+            bar = self.scrollBars[orientation]
+            bar.setValue(int(bar.value() - delta))
 
     def setZoom(self, value):
         self.actions.fitWidth.setChecked(False)
@@ -2247,7 +2482,6 @@ class MainWindow(QMainWindow):
                         [[s[0] * width, s[1] * height] for s in box["ratio"]],
                         DEFAULT_LOCK_COLOR,
                         key_cls,
-                        box["difficult"],
                     )
                 )
             else:
@@ -2257,7 +2491,6 @@ class MainWindow(QMainWindow):
                         [[s[0] * width, s[1] * height] for s in box["ratio"]],
                         DEFAULT_LOCK_COLOR,
                         key_cls,
-                        box["difficult"],
                     )
                 )
         if img_idx in self.PPlabel.keys():
@@ -2269,7 +2502,6 @@ class MainWindow(QMainWindow):
                         box["points"],
                         None,
                         key_cls,
-                        box.get("difficult", False),
                     )
                 )
 
@@ -2519,6 +2751,7 @@ class MainWindow(QMainWindow):
         self.reRecogButton.setEnabled(True)
         self.tableRecButton.setEnabled(True)
         self.actions.AutoRec.setEnabled(True)
+        self.actions.autoRecCurrent.setEnabled(True)
         self.actions.reRec.setEnabled(True)
         self.actions.tableRec.setEnabled(True)
         self.actions.open_dataset_dir.setEnabled(True)
@@ -2660,41 +2893,27 @@ class MainWindow(QMainWindow):
         if deletePath is not None:
             deleteInfo = self.deleteImgDialog()
             if deleteInfo == QMessageBox.Yes:
-                if platform.system() == "Windows":
-                    # from win32com import shell, shellcon
-                    # shell.SHFileOperation((0, shellcon.FO_DELETE, deletePath, None,
-                    #                        shellcon.FOF_SILENT | shellcon.FOF_ALLOWUNDO | shellcon.FOF_NOCONFIRMATION,
-                    #                        None, None))
-                    os.remove(deletePath)
-                    # linux
-                elif platform.system() == "Linux":
-                    cmd = "trash " + deletePath
-                    os.system(cmd)
-                    # macOS
-                elif platform.system() == "Darwin":
-                    import subprocess
+                imgidx = self.getImglabelidx(deletePath)
+                try:
+                    deleteSucceeded = moveFileToTrash(deletePath)
+                except Exception as error:
+                    logger.exception("Failed to move image to trash: %s", error)
+                    deleteSucceeded = False
 
-                    absPath = (
-                        os.path.abspath(deletePath)
-                        .replace("\\", "\\\\")
-                        .replace('"', '\\"')
+                if not deleteSucceeded:
+                    QMessageBox.warning(
+                        self,
+                        "Attention",
+                        "The image could not be moved to the recycle bin.",
                     )
-                    cmd = [
-                        "osascript",
-                        "-e",
-                        'tell app "Finder" to move {the POSIX file "'
-                        + absPath
-                        + '"} to trash',
-                    ]
-                    logger.debug("Executing command: %s", " ".join(cmd))
-                    subprocess.call(cmd, stdout=open(os.devnull, "w"))
+                    return
 
-                if self.filePath in self.fileStatedict.keys():
-                    self.fileStatedict.pop(self.filePath)
-                imgidx = self.getImglabelidx(self.filePath)
-                if imgidx in self.PPlabel.keys():
-                    self.PPlabel.pop(imgidx)
-
+                self.fileStatedict.pop(imgidx, None)
+                self.PPlabel.pop(imgidx, None)
+                self.Cachelabel.pop(imgidx, None)
+                self.saveFilestate()
+                self.savePPlabel(mode="Auto")
+                self.saveCacheLabel()
                 self.importDirImages(self.lastOpenDir, isDelete=True)
 
     def deleteImgDialog(self):
@@ -3038,6 +3257,46 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.information(self, "Information", "Draw a box!")
 
+    def autoRecognitionCurrent(self):
+        if self.canvas.shapes:
+            msg = (
+                "This will delete all existing boxes and re-detect the image. Do you want to continue?"
+                if self.lang != "ch"
+                else "这将删除所有现有的标注框并重新检测图像。您要继续吗？"
+            )
+            reply = QMessageBox.question(
+                self,
+                "Warning",
+                msg,
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply == QMessageBox.No:
+                return
+
+        img = cv2.imdecode(np.fromfile(self.filePath, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            return
+        self.result_dic = []
+        self.result_dic_locked = []
+        h, w, _ = img.shape
+        if h > 32 and w > 32:
+            result = self.ocr.predict(img)[0]
+            for poly, text, score in zip(
+                result["rec_polys"],
+                result["rec_texts"],
+                result["rec_scores"],
+            ):
+                # Convert numpy array to list for JSON serialization
+                poly_list = poly.tolist() if hasattr(poly, "tolist") else poly
+                self.result_dic.append([poly_list, (text, score)])
+
+        self.canvas.isInTheSameImage = True
+        self.saveFile(mode="Auto")
+        self.loadFile(self.filePath, isAdjustScale=False)
+        self.canvas.isInTheSameImage = False
+        self.setDirty()
+
     def singleRerecognition(self):
         img = cv2.imdecode(np.fromfile(self.filePath, dtype=np.uint8), cv2.IMREAD_COLOR)
         for shape in self.canvas.selectedShapes:
@@ -3155,7 +3414,6 @@ class MainWindow(QMainWindow):
                     # If not, fix them.
                     x, y, _ = self.canvas.snapPointToCanvas(x, y)
                     shape.addPoint(QPointF(x, y))
-                shape.difficult = False
                 shape.idx = order_index
                 order_index += 1
                 # shape.locked = False
@@ -3364,6 +3622,17 @@ class MainWindow(QMainWindow):
         self.comboBox.addItems(
             ["Chinese & English", "English", "French", "German", "Korean", "Japanese"]
         )
+        model_labels = {
+            "ch": "Chinese & English",
+            "en": "English",
+            "french": "French",
+            "german": "German",
+            "korean": "Korean",
+            "japan": "Japanese",
+        }
+        self.comboBox.setCurrentText(
+            model_labels.get(self.model_lang, "Chinese & English")
+        )
         vbox.addWidget(self.panel)
         vbox.addWidget(self.comboBox)
         self.dialog = QDialog()
@@ -3401,16 +3670,34 @@ class MainWindow(QMainWindow):
         if current_text in lg_idx:
             choose_lang = lg_idx[current_text]
             if hasattr(self, "ocr"):
-                del self.ocr
-                self.ocr = PaddleOCR(
-                    use_doc_orientation_classify=False,
-                    use_textline_orientation=False,
-                    use_doc_unwarping=False,
-                    text_detection_model_name="PP-OCRv5_mobile_det",
-                    text_recognition_model_name="PP-OCRv5_mobile_rec",
-                    lang=choose_lang,
+                rec_model_name = getRecognitionModelName(
+                    choose_lang, self.rec_model_name, self.rec_model_dir
+                )
+
+                params = {
+                    "use_doc_orientation_classify": False,
+                    "use_textline_orientation": False,
+                    "use_doc_unwarping": False,
+                    "text_detection_model_name": self.det_model_name,
+                    "text_recognition_model_name": rec_model_name,
+                    "device": self.gpu,
+                    "enable_mkldnn": False,
+                }
+                if self.det_model_dir is not None:
+                    params["text_detection_model_dir"] = self.det_model_dir
+                if self.rec_model_dir is not None:
+                    params["text_recognition_model_dir"] = self.rec_model_dir
+                if self.cls_model_dir is not None:
+                    params["text_line_orientation_model_dir"] = self.cls_model_dir
+
+                selected_ocr = PaddleOCR(**params)
+                selected_text_recognizer = TextRecognition(
+                    model_name=rec_model_name,
+                    model_dir=self.rec_model_dir,
                     device=self.gpu,
                 )
+                self.ocr = selected_ocr
+                self.text_recognizer = selected_text_recognizer
             if choose_lang in ["ch", "en"]:
                 if hasattr(self, "table_ocr"):
                     del self.table_ocr
@@ -3424,6 +3711,7 @@ class MainWindow(QMainWindow):
                     use_region_detection=False,
                     device=self.gpu,
                 )
+            self.model_lang = choose_lang
         else:
             logger.error("Invalid language selection")
         self.dialog.close()
@@ -3517,8 +3805,6 @@ class MainWindow(QMainWindow):
                         np.fromfile(img_path, dtype=np.uint8), cv2.IMREAD_COLOR
                     )
                     for i, label in enumerate(self.PPlabel[idx]):
-                        if label["difficult"]:
-                            continue
                         img_crop = get_rotate_crop_image(
                             img, np.array(label["points"], np.float32)
                         )
@@ -3632,7 +3918,6 @@ class MainWindow(QMainWindow):
                 ratio=[
                     [int(p.x()) / width, int(p.y()) / height] for p in s.points
                 ],  # QPonitF
-                difficult=s.difficult,  # bool
                 key_cls=s.key_cls,  # bool
             )
 
@@ -3647,7 +3932,7 @@ class MainWindow(QMainWindow):
                 trans_dict = {
                     "transcription": box["label"],
                     "ratio": box["ratio"],
-                    "difficult": box["difficult"],
+                    "difficult": False,
                 }
                 if self.kie_mode:
                     trans_dict.update({"key_cls": box["key_cls"]})
@@ -3695,69 +3980,114 @@ class MainWindow(QMainWindow):
             [max(p[1] for p in rect) - min(p[1] for p in rect) for rect in rectangles]
         ) / len(rectangles)
         threshold = avg_height * row_height_threshold
+
+        # Keep track of original indices to handle duplicates correctly
         indexed_rects = [(i, get_top_left(rect)) for i, rect in enumerate(rectangles)]
         indexed_rects.sort(key=lambda x: x[1][1])
+
         rows = []
         current_row = []
-        last_y = indexed_rects[0][1][1]
-        for item in indexed_rects:
-            i, (x, y) = item
-            if abs(y - last_y) <= threshold:
-                current_row.append(item)
-            else:
+        if indexed_rects:
+            last_y = indexed_rects[0][1][1]
+            for item in indexed_rects:
+                i, (x, y) = item
+                if abs(y - last_y) <= threshold:
+                    current_row.append(item)
+                else:
+                    rows.append(current_row)
+                    current_row = [item]
+                last_y = y
+            if current_row:
                 rows.append(current_row)
-                current_row = [item]
-            last_y = y
-        if current_row:
-            rows.append(current_row)
-        sorted_rects = []
+
+        sorted_indices = []
         for row in rows:
             row.sort(key=lambda x: x[1][0])
-            sorted_rects.extend([rectangles[i] for i, _ in row])
-        return sorted_rects
+            sorted_indices.extend([i for i, _ in row])
+        return sorted_indices
 
     def resortBoxPosition(self):
-        # get original elements
-        items = []
-        for i in range(self.BoxList.count()):
-            item = self.BoxList.item(i)
-            items.append({"text": item.text(), "object": item})
-        # get coordinate points
+        # get coordinate points from shapes directly to be more reliable
         rectangles = []
-        for item in items:
-            text = item["text"]
-            try:
-                rect = ast.literal_eval(text)  # 转为列表
-                rectangles.append(rect)
-            except (ValueError, SyntaxError) as e:
-                logger.error(f"Error parsing text: {text}")
-                continue
-        # start resort
-        sorted_rectangles = self.sort_rectangles(rectangles, row_height_threshold=0.5)
-        # old_idx <--> new_idx
-        index_map = []
-        for sorted_rect in sorted_rectangles:
-            for old_idx, rect in enumerate(rectangles):
-                if rect == sorted_rect:
-                    index_map.append(old_idx)
-                    break
-        # resort BoxList labelList canvas.shapes
-        items = [self.BoxList.takeItem(0) for _ in range(self.BoxList.count())]
+        for shape in self.canvas.shapes:
+            rect = [[int(p.x()), int(p.y())] for p in shape.points]
+            rectangles.append(rect)
+
+        if not rectangles:
+            return
+
+        # start resort - now returns indices
+        index_map = self.sort_rectangles(rectangles, row_height_threshold=0.5)
+
+        if len(index_map) != len(self.canvas.shapes):
+            logger.error("Resort failed: index map size mismatch")
+            return
+
+        # resort BoxList, labelList, and canvas.shapes
+        # Take all items out first
+        items_box = [self.BoxList.takeItem(0) for _ in range(self.BoxList.count())]
         items_label = [
             self.labelList.takeItem(0) for _ in range(self.labelList.count())
         ]
-        shapes = self.canvas.shapes
+        shapes = list(self.canvas.shapes)
+
         self.canvas.shapes = []
-        for new_idx in range(len(index_map)):
-            old_idx = index_map[new_idx]
-            self.BoxList.insertItem(new_idx, items[old_idx])
+        for new_idx, old_idx in enumerate(index_map):
+            self.BoxList.insertItem(new_idx, items_box[old_idx])
             self.labelList.insertItem(new_idx, items_label[old_idx])
-            self.canvas.shapes.insert(new_idx, shapes[old_idx])
+            self.canvas.shapes.append(shapes[old_idx])
+
+        # Update internal indices and refresh UI
+        self.updateIndexList()
+        for i, shape in enumerate(self.canvas.shapes):
+            shape.idx = i
+
+        self.canvas.update()
+        self.setDirty()
+
         QMessageBox.information(
             self,
             "Information",
             "resort success!",
         )
+
+    def convertToRect(self):
+        if not self.canvas.selectedShapes:
+            return
+
+        changed = False
+        for shape in self.canvas.selectedShapes:
+            if not shape.points:
+                continue
+
+            if len(shape.points) == 4:
+                p0, p1, p2, p3 = shape.points
+                if (
+                    p0.x() == p3.x()
+                    and p0.y() == p1.y()
+                    and p2.x() == p1.x()
+                    and p2.y() == p3.y()
+                ):
+                    continue
+
+            min_x = min(p.x() for p in shape.points)
+            max_x = max(p.x() for p in shape.points)
+            min_y = min(p.y() for p in shape.points)
+            max_y = max(p.y() for p in shape.points)
+
+            shape.points = [
+                QPointF(min_x, min_y),
+                QPointF(max_x, min_y),
+                QPointF(max_x, max_y),
+                QPointF(min_x, max_y),
+            ]
+            shape.close()
+            changed = True
+
+        if changed:
+            self.updateBoxlist()
+            self.setDirty()
+            self.canvas.repaint()
 
 
 def inverted(color):
@@ -3808,7 +4138,13 @@ def get_main_app(argv=[]):
         nargs="?",
     )
     arg_parser.add_argument("--det_model_dir", type=str, default=None, nargs="?")
+    arg_parser.add_argument(
+        "--det_model_name", type=str, default="PP-OCRv5_mobile_det", nargs="?"
+    )
     arg_parser.add_argument("--rec_model_dir", type=str, default=None, nargs="?")
+    arg_parser.add_argument(
+        "--rec_model_name", type=str, default="PP-OCRv5_mobile_rec", nargs="?"
+    )
     arg_parser.add_argument("--rec_char_dict_path", type=str, default=None, nargs="?")
     arg_parser.add_argument("--cls_model_dir", type=str, default=None, nargs="?")
     arg_parser.add_argument(
@@ -3832,7 +4168,9 @@ def get_main_app(argv=[]):
         kie_mode=args.kie,
         default_predefined_class_file=args.predefined_classes_file,
         det_model_dir=args.det_model_dir,
+        det_model_name=args.det_model_name,
         rec_model_dir=args.rec_model_dir,
+        rec_model_name=args.rec_model_name,
         cls_model_dir=args.cls_model_dir,
         bbox_auto_zoom_center=args.bbox_auto_zoom_center,
         label_font_path=args.label_font_path,
@@ -3844,7 +4182,17 @@ def get_main_app(argv=[]):
 
 def main():
     """construct main app and run it"""
-    app, _win = get_main_app(sys.argv)
+    app, win = get_main_app(sys.argv)
+
+    # Capture SIGINT (Ctrl+C) and trigger window close
+    signal.signal(signal.SIGINT, lambda *args: win.close())
+
+    # Python signal handlers only run when the interpreter is active.
+    # QTimer keeps the interpreter active periodically during the event loop.
+    timer = QTimer()
+    timer.start(500)
+    timer.timeout.connect(lambda: None)
+
     return app.exec_()
 
 
